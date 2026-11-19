@@ -446,3 +446,23 @@ func TestSuppressedRelaunchIsMetered(t *testing.T) {
 		t.Fatalf("suppression inflated FRewarms (%d)", got)
 	}
 }
+
+// Opening a bubble is the operator asking for a claude session there. The
+// crash-loop gate exists to stop BACKGROUND sweeps re-paying a doomed launch;
+// it must never leave the operator staring at nothing. EnsureForOperator clears
+// a backoff or a give-up and launches, so entering any bubble yields a session.
+func TestEnsureForOperatorBypassesCrashLoopGate(t *testing.T) {
+	f := newCrashLoop(t)
+	f.fr.FailLaunch = true
+	for i := 0; i < 10; i++ { // drive it into backoff / give-up
+		_ = f.k.EnsureAlive(f.a)
+		f.advance(time.Hour)
+	}
+	f.fr.FailLaunch = false // whatever broke is fixed (or never was: a lost resume)
+	if s := f.k.EnsureAlive(f.a); s != nil {
+		t.Skip("gate did not hold the background path; nothing to bypass")
+	}
+	if s := f.k.EnsureForOperator(f.a); s == nil || !s.Alive() {
+		t.Fatal("operator entering a gated bubble got no session")
+	}
+}

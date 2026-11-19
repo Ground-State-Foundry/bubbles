@@ -288,6 +288,7 @@ func (r *LocalRunner) Launch(a addr.Address, dir string, opts SpawnOpts) (Sessio
 		return nil, err
 	}
 	s := &ptySession{cmd: cmd, ptmx: ptmx, interrupt: r.InterruptByte, created: time.Now(), resume: opts.Resume, menuThreshold: r.ResumeSummaryThreshold}
+	go s.reap()         // collect the process on exit: no zombie, and Alive turns false
 	go s.drain()        // start reading immediately so claude never blocks on a full PTY buffer
 	go s.readyWatcher() // boot detection + auto-answer the resume "summary/as-is" menu
 	r.mu.Lock()
@@ -386,6 +387,17 @@ type ptySession struct {
 	resume        bool        // this launch is a --resume (may show the summary menu)
 	menuThreshold int         // token threshold for the summary-menu autopilot (0 = off)
 	inputReady    atomic.Bool // true once claude is at a real input prompt (past any resume menu)
+	trustAnswered atomic.Bool // the workspace-trust dialog has been answered (see answerTrustDialog)
+	exited        atomic.Bool // set by reap() once the process has exited and been waited on
+}
+
+// reap waits on the process so an exited claude is collected instead of left a
+// zombie, and records the exit for Alive. Without it a signal-0 probe succeeds
+// on the zombie, so a bubble whose claude had quit (a lost --resume, a crash, an
+// OOM kill) reported Alive forever and was never relaunched.
+func (s *ptySession) reap() {
+	_ = s.cmd.Wait()
+	s.exited.Store(true)
 }
 
 // InputReady reports whether claude is booted and at a real input prompt — i.e.
@@ -441,6 +453,9 @@ func (s *ptySession) readyWatcher() {
 				s.inputReady.Store(true)
 				return
 			}
+			if s.answerTrustDialog() {
+				firstOut = time.Now() // the resume menu (if any) only starts loading now
+			}
 			out := s.RecentOutput()
 			if strings.Contains(out, resumeMenuOpt1) && strings.Contains(out, resumeMenuOpt2) {
 				s.answerResumeMenu(out)
@@ -460,12 +475,55 @@ func (s *ptySession) readyWatcher() {
 		if !s.Alive() {
 			break
 		}
+		if s.answerTrustDialog() {
+			settleDeadline = time.Now().Add(20 * time.Second) // claude boots for real only now
+			continue
+		}
 		if s.idleFor() >= 1200*time.Millisecond {
 			break // settled -> at the prompt
 		}
 		time.Sleep(150 * time.Millisecond)
 	}
 	s.inputReady.Store(true)
+}
+
+// trustDialogYes is the stable label of the affirmative option in claude's
+// first-run "Do you trust this folder?" dialog, compared with all whitespace and
+// escapes removed (claude separates words with cursor-forward escapes).
+const trustDialogYes = "Yes,Itrustthisfolder"
+
+// trustDialogSettle is how long the dialog's output must be quiet before the
+// autopilot answers it (see answerTrustDialog).
+const trustDialogSettle = 800 * time.Millisecond
+
+// answerTrustDialog picks "Yes, I trust this folder" if claude is showing its
+// workspace-trust dialog, once per session. The default highlighted option is
+// "No, exit", so an unanswered dialog left the bubble stuck at boot forever:
+// never input-ready, mail never delivered, a stalled screen on dive. The
+// operator created this bubble in this folder — that is the trust decision —
+// and bubbles already ignores the folder's .mcp.json (--strict-mcp-config).
+func (s *ptySession) answerTrustDialog() bool {
+	if s.trustAnswered.Load() {
+		return false
+	}
+	flat := strings.Join(strings.Fields(ansiRE.ReplaceAllString(s.RecentOutput(), "")), "")
+	if !strings.Contains(flat, trustDialogYes) {
+		return false
+	}
+	// Keys sent the instant the dialog paints are lost: claude redraws it once
+	// its input handler is up and the highlight snaps back to "No, exit"
+	// (measured on claude 2.1.328 — Down+Enter right away exits; after the
+	// output has been quiet a beat, it trusts). Answer once it has settled.
+	if s.idleFor() < trustDialogSettle {
+		return false
+	}
+	s.trustAnswered.Store(true)
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	_, _ = s.ptmx.Write([]byte("\x1b[B")) // down -> "Yes, I trust this folder"
+	time.Sleep(150 * time.Millisecond)
+	_, _ = s.ptmx.Write([]byte("\r"))
+	return true
 }
 
 // answerResumeMenu selects an option in the resume menu. The menu is a select
@@ -666,10 +724,10 @@ func (s *ptySession) Close() error {
 	return nil
 }
 
-// Alive probes the process on-demand (signal 0 — no watcher goroutine): true
-// while claude is running, false once it has exited/crashed.
+// Alive reports whether claude is still running: false once reap has seen it
+// exit, and (belt and braces) false if a signal-0 probe fails.
 func (s *ptySession) Alive() bool {
-	if s.cmd == nil || s.cmd.Process == nil {
+	if s.cmd == nil || s.cmd.Process == nil || s.exited.Load() {
 		return false
 	}
 	return s.cmd.Process.Signal(syscall.Signal(0)) == nil

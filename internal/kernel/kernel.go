@@ -832,6 +832,20 @@ func (k *Kernel) RecoverUnread(hotOnly bool) {
 // managed via StartRoot / dive-in). Returns nil if a has no launchable session.
 func (k *Kernel) EnsureAlive(a addr.Address) runner.Session { return k.ensureAlive(a, true) }
 
+// EnsureForOperator is EnsureAlive for the operator opening a bubble. Entering a
+// bubble means "give me a claude session here": a crash-loop backoff or give-up
+// is a guard against background sweeps re-paying a doomed launch, not against
+// the operator, so it is cleared first. ensureAlive itself already resumes the
+// stored conversation and falls back to a FRESH session when that conversation
+// is gone, so the operator always lands in a live session unless the launch
+// itself genuinely cannot start.
+func (k *Kernel) EnsureForOperator(a addr.Address) runner.Session {
+	if cur := k.session(a); cur == nil || !cur.Alive() {
+		k.ClearRelaunchFailures(a)
+	}
+	return k.ensureAlive(a, true)
+}
+
 // ensureAlive is EnsureAlive with control over the rewarm metric. meterRewarm
 // is false for the ONE caller whose relaunch is not paging-induced
 // (RelaunchSession, a deliberate config bounce): see the note there.

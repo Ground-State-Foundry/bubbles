@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -459,5 +460,95 @@ func TestWrapInScope(t *testing.T) {
 	}
 	if sep < 0 || args[sep+1] != "claude" || args[sep+2] != "--foo" || args[sep+3] != "bar" {
 		t.Fatalf("command not preserved after --: %v", args)
+	}
+}
+
+// TestExitedSessionIsNotAlive is the regression test for bubbles that "do
+// nothing": a claude that exits (a lost --resume prints "No conversation found"
+// and quits; a crash; an OOM kill) used to stay an unreaped zombie, and a
+// signal-0 probe SUCCEEDS on a zombie — so Alive() said true forever, EnsureAlive
+// never relaunched, and diving in showed the dead session's last screen. The
+// session must report dead once its process exits, and the process must be
+// reaped (no zombie left under the daemon).
+func TestExitedSessionIsNotAlive(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "stub.sh")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\necho 'No conversation found with session ID: x'\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := NewLocal()
+	r.Bin = stub
+	r.InterruptByte = 0
+	r.MemMaxMB = 0
+	sess, err := r.Launch("0.1", dir, SpawnOpts{SessionID: "x", Resume: true})
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	defer r.Kill("0.1")
+	pid := sess.(*ptySession).cmd.Process.Pid
+
+	deadline := time.Now().Add(5 * time.Second)
+	for sess.Alive() && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if sess.Alive() {
+		t.Fatal("session whose process exited still reports Alive() — zombie passes the signal-0 probe")
+	}
+	// Reaped: /proc/<pid> is gone (a zombie keeps it, in state Z).
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat("/proc/" + strconv.Itoa(pid)); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	b, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	t.Fatalf("exited claude was never reaped (zombie): %s", b)
+}
+
+// TestTrustDialogAutopilot: claude asks "Do you trust this folder?" (default
+// highlighted option "No, exit") the first time it runs in a folder. A bubble
+// there used to sit on that dialog forever — never input-ready, so its mail
+// never landed and diving in showed a stalled boot. The operator created the
+// bubble in that folder, which IS the trust decision, so the autopilot picks
+// "Yes, I trust this folder" (Down, Enter). claude draws words separated by
+// cursor-forward escapes, not spaces, so the match must survive that.
+func TestTrustDialogAutopilot(t *testing.T) {
+	for _, resume := range []bool{false, true} {
+		ptmx, tty, err := pty.Open()
+		if err != nil {
+			t.Skipf("pty.Open unavailable: %v", err)
+		}
+		if old, err := term.MakeRaw(int(tty.Fd())); err == nil {
+			defer term.Restore(int(tty.Fd()), old)
+		}
+		s := &ptySession{ptmx: ptmx, cmd: aliveCmd(t), resume: resume, menuThreshold: 500_000, created: time.Now()}
+		go s.drain()
+		go s.readyWatcher()
+		w := func(words string) string { return strings.ReplaceAll(words, " ", "\x1b[1C") }
+		fmt.Fprintf(tty, "%s\r\n❯ 1. %s\r\n  2. %s\r\n", w("Quick safety check: Is this a project you created or one you trust?"), w("No, exit"), w("Yes, I trust this folder"))
+
+		got := make(chan []byte, 1)
+		go func() {
+			var acc []byte
+			buf := make([]byte, 64)
+			for !bytes.Contains(acc, []byte("\r")) {
+				n, err := tty.Read(buf)
+				if err != nil {
+					break
+				}
+				acc = append(acc, buf[:n]...)
+			}
+			got <- acc
+		}()
+		select {
+		case keys := <-got:
+			if !bytes.HasPrefix(keys, []byte("\x1b[B")) || !bytes.HasSuffix(keys, []byte("\r")) {
+				t.Fatalf("resume=%v: want Down then Enter (select \"Yes, I trust\"), got %q", resume, keys)
+			}
+		case <-time.After(4 * time.Second):
+			t.Fatalf("resume=%v: autopilot never answered the trust dialog", resume)
+		}
+		ptmx.Close()
+		tty.Close()
 	}
 }
