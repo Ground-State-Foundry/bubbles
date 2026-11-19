@@ -1037,10 +1037,11 @@ func diveScan(armed bool, p []byte) (forward []byte, cmd byte, rest []byte, arme
 // into it while you're there — its incoming messages wait in its inbox and are
 // delivered when you leave (k.SetFocus / UnsetFocus). It returns "" to go back
 // to the fleet, or the address of another bubble to switch directly into
-// (leader + digit). EnsureAlive heals a dead session first, so diving into a
-// crashed bubble (or one whose resume id vanished) transparently relaunches it.
+// (leader + digit). EnsureForOperator heals a dead session first — clearing any
+// crash-loop give-up, resuming the conversation, or starting a fresh one when
+// the conversation is gone — so entering any bubble lands in a claude session.
 func diveInto(k *kernel.Kernel, a addr.Address, marks map[int]addr.Address) (next addr.Address, launched bool) {
-	sess := k.EnsureAlive(a)
+	sess := k.EnsureForOperator(a)
 	ps, ok := sess.(runner.PTYSession)
 	if !ok || ps == nil {
 		return "", false // launch failed (bad dir/args, crashed on boot) — caller surfaces it
